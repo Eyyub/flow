@@ -191,7 +191,7 @@ module rec Parse : sig
   val module_body : term_fn:(token->bool) -> env -> Ast.Statement.t list
   val expression : env -> Ast.Expression.t
   val assignment : env -> Ast.Expression.t
-  val object_initializer : env -> Loc.t * Ast.Expression.Object.t
+  val object_initializer : ?in_pattern:bool -> env -> Loc.t * Ast.Expression.Object.t
   val array_initializer : env -> Loc.t * Ast.Expression.Array.t
   val identifier : ?restricted_error:Error.t -> env -> Ast.Identifier.t
   val identifier_or_reserved_keyword : env -> Ast.Identifier.t
@@ -747,7 +747,7 @@ end = struct
     let pattern env restricted_error =
       match Peek.token env with
       | T_LCURLY ->
-          let obj = Parse.object_initializer env in
+          let obj = Parse.object_initializer ~in_pattern:true env in
           Parse.object_pattern_with_type env obj
       | T_LBRACKET ->
           let arr = Parse.array_initializer env in
@@ -760,6 +760,7 @@ end = struct
       let rec pattern ((env, _) as check_env) (loc, p) = Pattern.(match p with
         | Object o -> _object check_env o
         | Array arr -> _array check_env arr
+        | Assignment a -> _assignment check_env a
         | Identifier id -> identifier check_env id
         | Expression _ -> (
             error_at env (loc, Error.InvalidLHSInFormalsList);
@@ -793,6 +794,9 @@ end = struct
         | Some (Element p) -> pattern check_env p
         | Some (Spread (_, { SpreadElement.argument; })) ->
             pattern check_env argument)
+
+      and _assignment check_env {Pattern.Assignment.left; _ } =
+        pattern check_env left
 
       and identifier (env, param_names) (loc, { Identifier.name; _ } as id) =
         if SSet.mem name param_names
@@ -1912,7 +1916,7 @@ end = struct
    * and classes *)
   module Object : sig
     val key : env -> Loc.t * Ast.Expression.Object.Property.key
-    val _initializer : env -> Loc.t * Ast.Expression.Object.t
+    val _initializer : ?in_pattern:bool -> env -> Loc.t * Ast.Expression.Object.t
     val class_declaration : env -> Ast.Statement.t
     val class_expression : env -> Ast.Expression.t
   end = struct
@@ -1985,7 +1989,7 @@ end = struct
       key, value
 
     let _initializer =
-      let rec property env = Ast.Expression.Object.(
+      let rec property in_pattern env = Ast.Expression.Object.(
         let start_loc = Peek.loc env in
         if Peek.token env = T_ELLIPSIS
         then begin
@@ -2005,17 +2009,17 @@ end = struct
               (match Peek.token env with
               | T_COLON
               | T_LESS_THAN
-              | T_LPAREN -> init env start_loc key false false
+              | T_LPAREN -> init in_pattern env start_loc key false false
               | _ -> get env start_loc)
           | false, false, (_, (Property.Identifier (_, { Ast.Identifier.name =
               "set"; _}) as key)) ->
               (match Peek.token env with
               | T_COLON
               | T_LESS_THAN
-              | T_LPAREN -> init env start_loc key false false
+              | T_LPAREN -> init in_pattern env start_loc key false false
               | _ -> set env start_loc)
           | async, generator, (_, key) ->
-              init env start_loc key async generator
+              init in_pattern env start_loc key async generator
           )
         end
       )
@@ -2044,7 +2048,7 @@ end = struct
           shorthand = false;
         })
 
-      and init env start_loc key async generator =
+      and init in_pattern env start_loc key async generator =
         Ast.Expression.Object.Property.(
           let value, shorthand, _method =
             match Peek.token env with
@@ -2054,6 +2058,19 @@ end = struct
                 | Literal lit -> fst lit, Ast.Expression.Literal (snd lit)
                 | Identifier id -> fst id, Ast.Expression.Identifier id
                 | Computed expr -> expr), true, false
+            | T_ASSIGN when in_pattern -> (* HACK *)
+                Expect.token env T_ASSIGN;
+                let left = Ast.Pattern.(match key with
+                  | Literal lit -> fst lit, Expression (fst lit, Ast.Expression.Literal (snd lit))
+                  | Computed expr -> fst expr, Expression expr
+                  | Identifier id -> fst id, Ast.Pattern.Identifier id)
+                in
+                let right = Parse.assignment env in
+                (Loc.btwn (fst left) (fst right), Ast.Expression.(Assignment Assignment.({
+                    operator = Assign;
+                    left;
+                    right;
+                  }))), true, false
             | T_LESS_THAN
             | T_LPAREN ->
                 let typeParameters = Type.type_parameter_declaration env in
@@ -2128,20 +2145,25 @@ end = struct
         | _ -> prop_map
       )
 
-      and properties env (prop_map, acc) =
+      and properties in_pattern env (prop_map, acc) =
         match Peek.token env with
         | T_EOF
         | T_RCURLY -> List.rev acc
         | _ ->
-            let prop = property env in
+            let prop = property in_pattern env in
             let prop_map = check_property env prop_map prop in
             if Peek.token env <> T_RCURLY then Expect.token env T_COMMA;
-            properties env (prop_map, prop::acc)
+            properties in_pattern env (prop_map, prop::acc)
 
-      in fun env ->
+      (* HACK : For pattern, Flow parses an expression and then 
+       * convert it to Pattern.t, but in an expression {a=3} which will be
+       * transform to {a : a = 3} is not allowed, but in a pattern it's ok
+       * so we add in_pattern parameter to hack and allow it.
+       * It will be converted to Pattern.Assignment later by Parse.pattern.*)
+      in fun ?(in_pattern=false) env ->
         let start_loc = Peek.loc env in
         Expect.token env T_LCURLY;
-        let props = properties env (SMap.empty, []) in
+        let props = properties in_pattern env (SMap.empty, []) in
         let end_loc = Peek.loc env in
         Expect.token env T_RCURLY;
         Loc.btwn start_loc end_loc, Ast.Expression.Object.({
@@ -3399,6 +3421,8 @@ end = struct
       Ast.Expression.(match expr with
       | Object obj -> _object env (loc, obj)
       | Array arr ->  _array env (loc, arr)
+      | Assignment {Assignment.operator = Assignment.Assign; left; right } ->
+          loc, Pattern.(Assignment Assignment.({ left; right}))
       | Identifier id -> loc, Pattern.Identifier id
       | expr -> loc, Pattern.Expression (loc, expr))
   end

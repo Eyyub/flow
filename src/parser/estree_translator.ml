@@ -681,6 +681,11 @@ end with type t = Impl.t) = struct
           "elements", array_of_list (option array_pattern_element) arr.Array.elements;
           "typeAnnotation", option type_annotation arr.Array.typeAnnotation;
         |]
+    | loc, Assignment {Assignment.left; right} ->
+        node "AssignmentPattern" loc [|
+          "left", pattern left;
+          "right", expression right
+        |]
     | _loc, Identifier id -> identifier id
     | _loc, Expression expr -> expression expr)
 

@@ -273,6 +273,9 @@ let rec extract_destructured_bindings accum pattern = Ast.Pattern.(
     let elems = n.Array.elements in
     List.fold_left extract_arr_elem_pattern_bindings accum elems
 
+  | Assignment a ->
+    extract_destructured_bindings accum (snd a.Assignment.left)
+
   | Expression(_) ->
     failwith "Parser Error: Expression patterns don't exist in JS."
 ) and extract_obj_prop_pattern_bindings accum = Ast.Pattern.(function
@@ -291,98 +294,6 @@ let rec extract_destructured_bindings accum pattern = Ast.Pattern.(
 
   | None -> accum
 )
-
-(* Destructuring visitor for tree-shaped patterns, parameteric over an action f
-   to perform at the leaves. A type for the pattern is passed, which is taken
-   apart as the visitor goes deeper. *)
-
-let rec destructuring cx t f = Ast.Pattern.(function
-  | loc, Array { Array.elements; _; } -> Array.(
-      let reason = mk_reason "array pattern" loc in
-      elements |> List.iteri (fun i -> function
-        | Some (Element ((loc, _) as p)) ->
-            let i = NumT (
-              mk_reason "number" loc,
-              Literal (float i, string_of_int i)
-            ) in
-            let tvar = Flow_js.mk_tvar cx reason in
-            Flow_js.flow cx (t, GetElemT(reason,i,tvar));
-            destructuring cx tvar f p
-        | Some (Spread (loc, { SpreadElement.argument })) ->
-            error_destructuring cx loc
-        | None ->
-            ()
-      )
-    )
-
-  | loc, Object { Object.properties; _; } -> Object.(
-      let xs = ref [] in
-      properties |> List.iter (function
-        | Property (loc, prop) -> Property.(
-            match prop with
-            | { key = Identifier (loc, id); pattern = p; } ->
-                let reason = mk_reason "object pattern property" loc in
-                let x = id.Ast.Identifier.name in
-                xs := x :: !xs;
-                let tvar = Flow_js.mk_tvar cx reason in
-                Flow_js.flow cx (t, GetT(reason,x,tvar));
-                destructuring cx tvar f p
-            | _ ->
-              error_destructuring cx loc
-          )
-        | SpreadProperty (loc, { SpreadProperty.argument }) ->
-            let reason = mk_reason "object pattern spread property" loc in
-            let tvar = Flow_js.mk_tvar cx reason in
-            Flow_js.flow cx (t, ObjRestT(reason,!xs,tvar));
-            destructuring cx tvar f argument
-      )
-    )
-
-  | loc, Identifier (_, { Ast.Identifier.name; _ }) ->
-      let type_ =
-        if Type_inference_hooks_js.dispatch_id_hook cx name loc
-        then AnyT.at loc
-        else t in
-      f cx loc name type_
-
-  | loc, _ -> error_destructuring cx loc
-)
-
-and error_destructuring cx loc =
-  let msg = "unsupported destructuring" in
-  Flow_js.add_error cx [mk_reason "" loc, msg]
-
-and type_of_pattern = Ast.Pattern.(function
-  | loc, Array { Array.typeAnnotation; _; } -> typeAnnotation
-
-  | loc, Object { Object.typeAnnotation; _; } -> typeAnnotation
-
-  | loc, Identifier (_, { Ast.Identifier.typeAnnotation; _; }) -> typeAnnotation
-
-  | loc, _ -> None
-)
-
-(* instantiate pattern visitor for assignments *)
-let destructuring_assignment cx t =
-  destructuring cx t (fun cx loc name t ->
-    let reason = mk_reason (spf "assignment of identifier %s" name) loc in
-    Env_js.set_var cx name t reason
-  )
-
-(* instantiate pattern visitor for parameters *)
-let destructuring_map cx t p =
-  let tmap, lmap = ref SMap.empty, ref SMap.empty in
-  p |> destructuring cx t (fun _ loc name t ->
-    tmap := !tmap |> SMap.add name t;
-    lmap := !lmap |> SMap.add name loc
-  );
-  !tmap, !lmap
-
-let pattern_decl cx t =
-  destructuring cx t (fun cx loc name t ->
-    Hashtbl.replace cx.type_table loc t;
-    Env_js.init_var cx name (Scope.create_entry t t (Some loc))
-  )
 
 (* type refinements on expressions - wraps Env_js API *)
 module Refinement : sig
@@ -2806,6 +2717,110 @@ and variable cx (loc, vdecl) = Ast.(
               ()
         )
 )
+
+(* Destructuring visitor for tree-shaped patterns, parameteric over an action f
+   to perform at the leaves. A type for the pattern is passed, which is taken
+   apart as the visitor goes deeper. *)
+
+and destructuring cx t f = Ast.Pattern.(function
+  | loc, Array { Array.elements; _; } -> Array.(
+      let reason = mk_reason "array pattern" loc in
+      elements |> List.iteri (fun i -> function
+        | Some (Element ((loc, _) as p)) ->
+            let i = NumT (
+              mk_reason "number" loc,
+              Literal (float i, string_of_int i)
+            ) in
+            let tvar = Flow_js.mk_tvar cx reason in
+            Flow_js.flow cx (t, GetElemT(reason,i,tvar));
+            destructuring cx tvar f p
+        | Some (Spread (loc, { SpreadElement.argument })) ->
+            error_destructuring cx loc
+        | None ->
+            ()
+      )
+    )
+
+  | loc, Object { Object.properties; _; } -> Object.(
+      let xs = ref [] in
+      properties |> List.iter (function
+        | Property (loc, prop) -> Property.(
+            match prop with
+            | { key = Identifier (loc, id); pattern = p; } ->
+                let reason = mk_reason "object pattern property" loc in
+                let x = id.Ast.Identifier.name in
+                xs := x :: !xs;
+                let is_cond = is_assignment (snd p) in
+                let tvar = get_prop ~is_cond cx reason t x in
+                (* let tvar = Flow_js.mk_tvar cx reason in *)
+                (* Flow_js.flow cx (t, GetT(reason,x,tvar)); *)
+                destructuring cx tvar f p
+            | _ ->
+              error_destructuring cx loc
+          )
+        | SpreadProperty (loc, { SpreadProperty.argument }) ->
+            let reason = mk_reason "object pattern spread property" loc in
+            let tvar = Flow_js.mk_tvar cx reason in
+            Flow_js.flow cx (t, ObjRestT(reason,!xs,tvar));
+            destructuring cx tvar f argument
+      )
+    )
+
+  | loc, Assignment { Assignment.left; right } ->
+      let rty = expression cx right in
+      destructuring cx rty f left;
+      Flow_js.flow cx (t, rty);
+      
+  | loc, Identifier (_, { Ast.Identifier.name; _ }) ->
+      let type_ =
+        if Type_inference_hooks_js.dispatch_id_hook cx name loc
+        then AnyT.at loc
+        else t in
+      f cx loc name type_
+
+  | loc, _ -> error_destructuring cx loc
+)
+
+and is_assignment = Ast.Pattern.(function
+  | Assignment _ -> true
+  | _ -> false
+)
+
+and error_destructuring cx loc =
+  let msg = "unsupported destructuring" in
+  Flow_js.add_error cx [mk_reason "" loc, msg]
+
+and type_of_pattern = Ast.Pattern.(function
+  | loc, Array { Array.typeAnnotation; _; } -> typeAnnotation
+
+  | loc, Object { Object.typeAnnotation; _; } -> typeAnnotation
+
+  | loc, Identifier (_, { Ast.Identifier.typeAnnotation; _; }) -> typeAnnotation
+
+  | loc, _ -> None
+)
+
+(* instantiate pattern visitor for assignments *)
+and destructuring_assignment cx t =
+  destructuring cx t (fun cx loc name t ->
+    let reason = mk_reason (spf "assignment of identifier %s" name) loc in
+    Env_js.set_var cx name t reason
+  )
+
+(* instantiate pattern visitor for parameters *)
+and destructuring_map cx t p =
+  let tmap, lmap = ref SMap.empty, ref SMap.empty in
+  p |> destructuring cx t (fun _ loc name t ->
+    tmap := !tmap |> SMap.add name t;
+    lmap := !lmap |> SMap.add name loc
+  );
+  !tmap, !lmap
+
+and pattern_decl cx t =
+  destructuring cx t (fun cx loc name t ->
+    Hashtbl.replace cx.type_table loc t;
+    Env_js.init_var cx name (Scope.create_entry t t (Some loc))
+  )
 
 and array_element cx undef_loc el = Ast.Expression.(
   match el with

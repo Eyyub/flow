@@ -1022,6 +1022,11 @@ and variable_decl cx type_params_map loc entry = Ast.Statement.(
       let r = mk_reason (spf "%s _" str_of_kind) loc in
       let t = type_of_pattern p |> mk_type_annotation cx type_params_map r in
       p |> destructuring cx t (fun cx loc name t ->
+        let t =
+          if Flow_js.possible_types_of_type cx t <> [] then
+            Flow_js.resolve_type cx t
+          else t
+        in
         Hashtbl.replace (Context.type_table cx) loc t;
         bind cx name t r
       )

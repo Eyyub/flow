@@ -297,7 +297,8 @@ let rec destructuring cx t f = Ast.Pattern.(function
             ) in
             let reason = mk_reason (spf "element %d" i) loc in
             let tvar = Flow_js.mk_tvar cx reason in
-            Flow_js.flow cx (t, GetElemT(reason, key, tvar));
+            (* Flow_js.flow cx (t, GetElemT(reason, key, tvar)); *)
+            Flow_js.flow cx (t, GetElemT(reason, key, BecomeT(reason, tvar)));
             destructuring cx tvar f p
         | Some (Spread (loc, { SpreadElement.argument })) ->
             error_destructuring cx loc
@@ -319,7 +320,12 @@ let rec destructuring cx t f = Ast.Pattern.(function
                 (* use the same reason for the prop name and the lookup.
                    given `var {foo} = ...`, `foo` is both. compare to `a.foo`
                    where `foo` is the name and `a.foo` is the lookup. *)
-                Flow_js.flow cx (t, GetPropT(reason, (reason, x), tvar));
+                (* Flow_js.flow cx (t, GetPropT(reason, (reason, x), tvar)); *)
+
+                (* Flow_js.flow cx (t, LookupT(reason, None, [], x, tvar)); *)
+
+                Flow_js.flow cx (t, GetPropT(reason, (reason, x), BecomeT (reason, tvar)));
+
                 destructuring cx tvar f p
             | _ ->
               error_destructuring cx loc
